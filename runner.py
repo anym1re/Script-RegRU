@@ -17,7 +17,7 @@ from stats import (
 )
 from telegram_utils import format_pre, send_telegram_message
 from timing_utils import cooldown_between_mutations
-from ui import list_ips_from_table, wait_page_ready
+from ui import list_ips_from_table, list_rows_from_table, wait_page_ready
 
 
 def choose_strategy(cfg: Config, logger) -> Tuple[str, List[ipaddress.IPv4Network]]:
@@ -57,12 +57,61 @@ def update_cycle_stats(ip: str, cycle_counts: Dict[str, int]) -> None:
 
 
 def notify_cycle_stats(logger, cycle_counts: Dict[str, int]) -> None:
+    summary = (
+        "Статистика подсетей за текущий цикл. "
+        "subnet = подсеть /24, total_count = сколько раз IP из этой подсети создан в этом цикле."
+    )
+    send_telegram_message(logger, summary)
     table = format_stats_table(cycle_counts).rstrip("\n")
     send_telegram_message(logger, format_pre(table), parse_mode="HTML")
 
 
-def notify_error(logger, message: str) -> None:
-    send_telegram_message(logger, f"Ошибка: {message}")
+def notify_error(logger, message: str, *, fatal: bool = True) -> None:
+    prefix = "Фатальная ошибка" if fatal else "Ошибка"
+    lower_message = message.lower()
+    if fatal and lower_message.startswith("фатальная ошибка"):
+        text = message
+    else:
+        text = f"{prefix}: {message}"
+    send_telegram_message(logger, text)
+
+
+def read_current_state(page) -> Tuple[List[str], int]:
+    rows = list_rows_from_table(page)
+    current_ips = [r.ip for r in rows if r.ip]
+    pending_slots = sum(1 for r in rows if r.status == "Создается" and not r.ip)
+    return current_ips, pending_slots
+
+
+def format_duration(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f} ч"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f} мин"
+    return f"{seconds:.1f} сек"
+
+
+def notify_status(logger, message: str) -> None:
+    send_telegram_message(logger, message)
+
+
+def notify_pause(logger, reason: str, seconds: float) -> None:
+    text = f"Пауза: {reason}. Длительность: {format_duration(seconds)}."
+    send_telegram_message(logger, text)
+
+
+def notify_target_hit(
+    logger,
+    ip: str,
+    subnet: ipaddress.IPv4Network,
+    total_ips: int,
+    total_subnets: int,
+) -> None:
+    text = (
+        f"Найден целевой IP: {ip} в {subnet}. "
+        f"Итог: IP={total_ips}, подсетей={total_subnets}."
+    )
+    send_telegram_message(logger, text)
 
 
 def exit_with_error(cfg: Config, logger, code: int, message: str) -> int:
@@ -130,8 +179,10 @@ def run(cfg: Config) -> int:
         matched_target_subnets: Set[str] = set()
         paused_after_first_target = False
         cycle_counts: Dict[str, int] = {}
+        cycle_index = 0
 
         while True:
+            cycle_index += 1
             ensure_logged_in(page, cfg, logger)
 
             if URL_FLOATING_IPS not in page.url:
@@ -140,9 +191,21 @@ def run(cfg: Config) -> int:
 
             base_ips = set(list_ips_from_table(page))
             logger.info("Base IPs (protected): %d", len(base_ips))
+            last_ips: Set[str] = set(base_ips)
 
             strategy, rare_networks = choose_strategy(cfg, logger)
             logger.info("Strategy for this run: %s", strategy)
+            cycle_details = [
+                f"Старт цикла #{cycle_index}.",
+                f"Стратегия: {strategy}.",
+                f"Базовых IP: {len(base_ips)}.",
+                f"Целевых CIDR: {len(target_networks)}.",
+            ]
+            if strategy == "rare":
+                cycle_details.append(
+                    f"Редких подсетей в бакете: {len(rare_networks)}."
+                )
+            notify_status(logger, " ".join(cycle_details))
 
             restart_cycle = False
 
@@ -160,6 +223,7 @@ def run(cfg: Config) -> int:
                 matched_rare_ips: Set[str] = set()
                 known_subnets = get_known_subnets(cfg, logger)
                 pause_after_cleanup_s: Optional[float] = None
+                pause_reason: Optional[str] = None
 
                 logger.info(
                     "Rare strategy: keep up to %d rare (probe slots=%d)",
@@ -208,6 +272,10 @@ def run(cfg: Config) -> int:
                                     "Фатальная ошибка при удалении IP (редкая стратегия).",
                                 )
                             pause_after_cleanup_s = cfg.failure_pause_s
+                            pause_reason = (
+                                "Нефатальная ошибка при удалении IP (редкая стратегия); "
+                                "перезапуск цикла"
+                            )
                             restart_cycle = True
                             break
                         wait_page_ready(page)
@@ -226,6 +294,10 @@ def run(cfg: Config) -> int:
                                     "Фатальная ошибка при удалении IP (редкая стратегия).",
                                 )
                             pause_after_cleanup_s = cfg.failure_pause_s
+                            pause_reason = (
+                                "Нефатальная ошибка при удалении IP (редкая стратегия); "
+                                "перезапуск цикла"
+                            )
                             restart_cycle = True
                             break
                         wait_page_ready(page)
@@ -249,6 +321,13 @@ def run(cfg: Config) -> int:
                             matched_target_ips.add(ip)
                             matched_target_subnets.add(str(hit_net))
                             logger.info("Target CIDR hit: %s in %s", ip, hit_net)
+                            notify_target_hit(
+                                logger,
+                                ip,
+                                hit_net,
+                                len(matched_target_ips),
+                                len(matched_target_subnets),
+                            )
                             logger.info("Переборный слот закрыт, редкая стратегия завершена.")
                             break
 
@@ -307,6 +386,10 @@ def run(cfg: Config) -> int:
                                 "Фатальная ошибка при создании IP (редкая стратегия).",
                             )
                         pause_after_cleanup_s = cfg.failure_pause_s
+                        pause_reason = (
+                            "Нефатальная ошибка при создании IP (редкая стратегия); "
+                            "перезапуск цикла"
+                        )
                         restart_cycle = True
                         break
 
@@ -315,6 +398,8 @@ def run(cfg: Config) -> int:
                         "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
                         cfg.failure_pause_s / 60,
                     )
+                    if pause_reason:
+                        notify_pause(logger, pause_reason, pause_after_cleanup_s)
                     time.sleep(pause_after_cleanup_s)
                     if restart_cycle:
                         continue
@@ -340,6 +425,7 @@ def run(cfg: Config) -> int:
 
                     round_created = []
                     pause_after_cleanup_s = None
+                    pause_reason = None
                     stop_after_cleanup = False
 
                     while True:
@@ -372,6 +458,13 @@ def run(cfg: Config) -> int:
                                 matched_target_ips.add(ip)
                                 matched_target_subnets.add(str(hit_net))
                                 logger.info("Target CIDR hit: %s in %s", ip, hit_net)
+                                notify_target_hit(
+                                    logger,
+                                    ip,
+                                    hit_net,
+                                    len(matched_target_ips),
+                                    len(matched_target_subnets),
+                                )
 
                                 if (
                                     len(matched_target_subnets)
@@ -386,6 +479,9 @@ def run(cfg: Config) -> int:
                                     )
                                 elif not paused_after_first_target:
                                     pause_after_cleanup_s = cfg.target_pause_s
+                                    pause_reason = (
+                                        "Получен IP из целевых подсетей; пауза перед продолжением"
+                                    )
                                     paused_after_first_target = True
 
                                 if stop_after_cleanup or pause_after_cleanup_s:
@@ -401,6 +497,10 @@ def run(cfg: Config) -> int:
                                     "Фатальная ошибка при создании IP (основная стратегия).",
                                 )
                             pause_after_cleanup_s = cfg.failure_pause_s
+                            pause_reason = (
+                                "Нефатальная ошибка при создании IP (основная стратегия); "
+                                "перезапуск цикла"
+                            )
                             restart_cycle = True
                             break
 
@@ -426,6 +526,10 @@ def run(cfg: Config) -> int:
                                     "Фатальная ошибка при удалении IP (основная стратегия).",
                                 )
                             pause_after_cleanup_s = cfg.failure_pause_s
+                            pause_reason = (
+                                "Нефатальная ошибка при удалении IP (основная стратегия); "
+                                "перезапуск цикла"
+                            )
                             restart_cycle = True
                             break
 
@@ -444,6 +548,10 @@ def run(cfg: Config) -> int:
                                     3,
                                     "Фатальная ошибка при финальной очистке.",
                                 )
+                            notify_status(
+                                logger,
+                                "Нефатальная ошибка при финальной очистке; завершаю работу.",
+                            )
                         notify_cycle_stats(logger, cycle_counts)
                         return 0
 
@@ -458,6 +566,8 @@ def run(cfg: Config) -> int:
                                 "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
                                 cfg.failure_pause_s / 60,
                             )
+                        if pause_reason:
+                            notify_pause(logger, pause_reason, pause_after_cleanup_s)
                         time.sleep(pause_after_cleanup_s)
                         if restart_cycle:
                             break
@@ -465,6 +575,7 @@ def run(cfg: Config) -> int:
                     if total_created < cfg.goal_total_created:
                         pause = random.uniform(cfg.round_pause_min_s, cfg.round_pause_max_s)
                         logger.info("Inter-round pause: %.1fs", pause)
+                        notify_pause(logger, "Пауза между раундами", pause)
                         time.sleep(pause)
 
                 if restart_cycle:
@@ -483,6 +594,11 @@ def run(cfg: Config) -> int:
                     "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
                     cfg.failure_pause_s / 60,
                 )
+                notify_pause(
+                    logger,
+                    "Нефатальная ошибка при финальной очистке; перезапуск цикла",
+                    cfg.failure_pause_s,
+                )
                 time.sleep(cfg.failure_pause_s)
                 continue
 
@@ -490,6 +606,7 @@ def run(cfg: Config) -> int:
             logger.info("Запуск завершен. Начинаю финальную паузу...")
             pause = random.uniform(cfg.final_pause_min_s, cfg.final_pause_max_s)
             logger.info("Final pause before new run: %.1fs", pause)
+            notify_pause(logger, "Финальная пауза перед новым циклом", pause)
             time.sleep(pause)
 
     except KeyboardInterrupt:
