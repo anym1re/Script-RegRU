@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from playwright.sync_api import sync_playwright
 
 from auth import ensure_logged_in
-from config import Config, URL_FLOATING_IPS
+from config import Config, IP_REGEX, URL_FLOATING_IPS
 from ip_ops import create_one_ip_moscow, delete_ip, has_fatal_error, match_target_network
 from logging_utils import acquire_lock, release_lock, setup_logging
 from stats import (
@@ -84,6 +84,39 @@ def read_current_state(page) -> Tuple[List[str], int]:
     current_ips = [r.ip for r in rows if r.ip]
     pending_slots = sum(1 for r in rows if r.status == "Создается" and not r.ip)
     return current_ips, pending_slots
+
+
+def read_base_ips(page, cfg: Config, logger, retries: int = 3) -> List[str]:
+    for attempt in range(1, retries + 1):
+        try:
+            try:
+                page.wait_for_selector(
+                    "div.fip-table__row, table tbody tr, [role='row']",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+
+            ips = list_ips_from_table(page)
+            if ips:
+                return ips
+
+            try:
+                body = page.inner_text("body") or ""
+            except Exception:
+                body = ""
+            fallback = IP_REGEX.findall(body)
+            if fallback:
+                return list(dict.fromkeys(fallback))
+        except Exception as e:
+            logger.warning(
+                "Не удалось прочитать базовые IP (попытка %d/%d): %s",
+                attempt,
+                retries,
+                e,
+            )
+        human_sleep(cfg, kind="poll")
+    return []
 
 
 def should_stop_due_to_target_slot(
@@ -356,7 +389,7 @@ def run(cfg: Config) -> int:
                 page.goto(URL_FLOATING_IPS)
                 wait_page_ready(page)
 
-            base_ips = set(list_ips_from_table(page))
+            base_ips = set(read_base_ips(page, cfg, logger, retries=3))
             logger.info("Base IPs (protected): %d", len(base_ips))
             last_ips: Set[str] = set(base_ips)
 
