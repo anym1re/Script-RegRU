@@ -60,7 +60,7 @@ class Config:
     target_goal_distinct_subnets: int = 2
     target_pause_s: int = 6 * 60 * 60
     stats_file: str = "daily_stats.txt"
-    strategy_mode: str = "single" #auto, single, rare
+    strategy_mode: str = "single"  # auto, main, rare, single
     strategy_auto_probability: float = 0.4
     single_goal_created_min: int = 120
     single_goal_created_max: int = 180
