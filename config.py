@@ -67,6 +67,9 @@ class Config:
     single_round_size: int = 10
     single_round_pause_min_s: int = 30
     single_round_pause_max_s: int = 180
+    single_reload_every_s: int = 5 * 60
+    single_max_reload_attempts: int = 3
+    single_restart_pause_s: int = 15 * 60
     rare_rotation_slots: int = 1
     rare_keep_max: int = 4
     rare_goal_created_min: int = 60

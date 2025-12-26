@@ -101,6 +101,97 @@ def should_stop_due_to_target_slot(
     return any(ip in current_set for ip in matched_target_ips)
 
 
+def wait_for_new_ip_single(
+    page,
+    cfg: Config,
+    logger,
+    before_ips: Set[str],
+) -> Tuple[str, Optional[str]]:
+    reloads = 0
+    next_reload_at = time.time() + cfg.single_reload_every_s
+
+    while True:
+        if has_fatal_error(page, cfg, logger):
+            return "fatal", None
+
+        if URL_FLOATING_IPS not in page.url:
+            page.goto(URL_FLOATING_IPS)
+            wait_page_ready(page)
+
+        try:
+            current_ips = set(list_ips_from_table(page))
+        except Exception as e:
+            logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
+            page.reload()
+            wait_page_ready(page)
+            reloads += 1
+            if reloads >= cfg.single_max_reload_attempts:
+                return "restart", None
+            continue
+
+        new_ips = current_ips - before_ips
+        if new_ips:
+            return "ok", next(iter(new_ips))
+
+        if reloads >= cfg.single_max_reload_attempts:
+            return "restart", None
+
+        if time.time() >= next_reload_at:
+            logger.info("Single wait: reload page while waiting for creation.")
+            page.reload()
+            wait_page_ready(page)
+            reloads += 1
+            next_reload_at = time.time() + cfg.single_reload_every_s
+            continue
+
+        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+
+
+def wait_for_ip_removal_single(
+    page,
+    cfg: Config,
+    logger,
+    ip: str,
+) -> str:
+    reloads = 0
+    next_reload_at = time.time() + cfg.single_reload_every_s
+
+    while True:
+        if has_fatal_error(page, cfg, logger):
+            return "fatal"
+
+        if URL_FLOATING_IPS not in page.url:
+            page.goto(URL_FLOATING_IPS)
+            wait_page_ready(page)
+
+        try:
+            current_ips = set(list_ips_from_table(page))
+        except Exception as e:
+            logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
+            page.reload()
+            wait_page_ready(page)
+            reloads += 1
+            if reloads >= cfg.single_max_reload_attempts:
+                return "restart"
+            continue
+
+        if ip not in current_ips:
+            return "ok"
+
+        if reloads >= cfg.single_max_reload_attempts:
+            return "restart"
+
+        if time.time() >= next_reload_at:
+            logger.info("Single wait: reload page while waiting for deletion.")
+            page.reload()
+            wait_page_ready(page)
+            reloads += 1
+            next_reload_at = time.time() + cfg.single_reload_every_s
+            continue
+
+        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+
+
 def wait_for_new_ip(
     page,
     cfg: Config,
@@ -647,52 +738,39 @@ def run(cfg: Config) -> int:
                     result = create_one_ip_moscow(page, cfg, logger)
                     if result.status == "created" and result.ip:
                         ip = result.ip
-                    elif result.status == "pending":
-                        logger.info(
-                            "Создание в статусе 'Создается'. Ожидание завершения."
-                        )
-                        ip = wait_for_new_ip(
+                    else:
+                        if result.status == "pending":
+                            logger.info(
+                                "Создание в статусе 'Создается'. Ожидание завершения."
+                            )
+                        else:
+                            logger.warning("Create failed/timeout.")
+
+                        wait_status, ip = wait_for_new_ip_single(
                             page,
                             cfg,
                             logger,
                             before_ips,
-                            cfg.create_result_timeout_s,
                         )
-                    else:
-                        logger.warning("Create failed/timeout.")
-                        if has_fatal_error(page, cfg, logger):
+                        if wait_status == "fatal":
                             logger.error("Фатальная ошибка. Выход.")
                             return exit_with_error(
                                 cfg,
                                 logger,
                                 2,
-                                "Фатальная ошибка при создании IP (одиночная стратегия).",
+                                "Фатальная ошибка при ожидании создания IP (одиночная стратегия).",
                             )
-                        pause_after_cleanup_s = cfg.failure_pause_s
-                        pause_reason = (
-                            "Нефатальная ошибка при создании IP (одиночная стратегия); "
-                            "перезапуск цикла"
-                        )
-                        restart_cycle = True
-                        break
-
-                    if not ip:
-                        logger.warning("Не удалось получить IP после ожидания.")
-                        if has_fatal_error(page, cfg, logger):
-                            logger.error("Фатальная ошибка. Выход.")
-                            return exit_with_error(
-                                cfg,
-                                logger,
-                                2,
-                                "Фатальная ошибка при создании IP (одиночная стратегия).",
+                        if wait_status == "restart" or not ip:
+                            logger.warning(
+                                "Создание не завершилось после ожидания. Перезапуск цикла."
                             )
-                        pause_after_cleanup_s = cfg.failure_pause_s
-                        pause_reason = (
-                            "Нефатальная ошибка при создании IP (одиночная стратегия); "
-                            "перезапуск цикла"
-                        )
-                        restart_cycle = True
-                        break
+                            pause_after_cleanup_s = cfg.single_restart_pause_s
+                            pause_reason = (
+                                "Создание не завершилось после ожидания; "
+                                "перезапуск цикла"
+                            )
+                            restart_cycle = True
+                            break
 
                     total_created += 1
                     round_created += 1
@@ -739,48 +817,37 @@ def run(cfg: Config) -> int:
                         cooldown_between_mutations(cfg, logger)
 
                         delete_result = delete_ip(page, cfg, logger, ip)
-                        if delete_result.status == "pending":
-                            logger.info("Удаление в процессе. Ожидание завершения.")
-                            if not wait_for_ip_removal(
+                        if delete_result.status != "deleted":
+                            if delete_result.status == "pending":
+                                logger.info("Удаление в процессе. Ожидание завершения.")
+                            else:
+                                logger.warning("Delete failed. Ожидание завершения.")
+
+                            wait_status = wait_for_ip_removal_single(
                                 page,
                                 cfg,
                                 logger,
                                 ip,
-                                cfg.delete_result_timeout_s,
-                            ):
-                                logger.warning("Удаление не завершилось по таймауту.")
-                                if has_fatal_error(page, cfg, logger):
-                                    logger.error("Фатальная ошибка. Выход.")
-                                    return exit_with_error(
-                                        cfg,
-                                        logger,
-                                        3,
-                                        "Фатальная ошибка при удалении IP (одиночная стратегия).",
-                                    )
-                                pause_after_cleanup_s = cfg.failure_pause_s
-                                pause_reason = (
-                                    "Нефатальная ошибка при удалении IP (одиночная стратегия); "
-                                    "перезапуск цикла"
-                                )
-                                restart_cycle = True
-                                break
-                        elif delete_result.status != "deleted":
-                            logger.warning("Delete failed.")
-                            if has_fatal_error(page, cfg, logger):
+                            )
+                            if wait_status == "fatal":
                                 logger.error("Фатальная ошибка. Выход.")
                                 return exit_with_error(
                                     cfg,
                                     logger,
                                     3,
-                                    "Фатальная ошибка при удалении IP (одиночная стратегия).",
+                                    "Фатальная ошибка при ожидании удаления IP (одиночная стратегия).",
                                 )
-                            pause_after_cleanup_s = cfg.failure_pause_s
-                            pause_reason = (
-                                "Нефатальная ошибка при удалении IP (одиночная стратегия); "
-                                "перезапуск цикла"
-                            )
-                            restart_cycle = True
-                            break
+                            if wait_status == "restart":
+                                logger.warning(
+                                    "Удаление не завершилось после ожидания. Перезапуск цикла."
+                                )
+                                pause_after_cleanup_s = cfg.single_restart_pause_s
+                                pause_reason = (
+                                    "Удаление не завершилось после ожидания; "
+                                    "перезапуск цикла"
+                                )
+                                restart_cycle = True
+                                break
 
                         wait_page_ready(page)
 
@@ -800,8 +867,8 @@ def run(cfg: Config) -> int:
 
                 if pause_after_cleanup_s:
                     logger.info(
-                        "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
-                        cfg.failure_pause_s / 60,
+                        "Пауза на %.1f минут и перезапуск цикла.",
+                        pause_after_cleanup_s / 60,
                     )
                     if pause_reason:
                         notify_pause(logger, pause_reason, pause_after_cleanup_s)
