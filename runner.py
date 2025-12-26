@@ -16,7 +16,7 @@ from stats import (
     update_daily_stats,
 )
 from telegram_utils import format_pre, send_telegram_message
-from timing_utils import cooldown_between_mutations
+from timing_utils import cooldown_between_mutations, human_sleep
 from ui import list_ips_from_table, list_rows_from_table, wait_page_ready
 
 
@@ -144,7 +144,7 @@ def wait_for_new_ip_single(
             next_reload_at = time.time() + cfg.single_reload_every_s
             continue
 
-        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+        human_sleep(cfg, kind="poll")
 
 
 def wait_for_ip_removal_single(
@@ -189,7 +189,7 @@ def wait_for_ip_removal_single(
             next_reload_at = time.time() + cfg.single_reload_every_s
             continue
 
-        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+        human_sleep(cfg, kind="poll")
 
 
 def wait_for_new_ip(
@@ -210,12 +210,12 @@ def wait_for_new_ip(
             logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
             page.reload()
             wait_page_ready(page)
-            time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+            human_sleep(cfg, kind="poll")
             continue
         new_ips = current_ips - before_ips
         if new_ips:
             return next(iter(new_ips))
-        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+        human_sleep(cfg, kind="poll")
     return None
 
 
@@ -237,11 +237,11 @@ def wait_for_ip_removal(
             logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
             page.reload()
             wait_page_ready(page)
-            time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+            human_sleep(cfg, kind="poll")
             continue
         if ip not in current_ips:
             return True
-        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+        human_sleep(cfg, kind="poll")
     return False
 
 
