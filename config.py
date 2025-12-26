@@ -32,6 +32,7 @@ class Config:
 
     mutation_cooldown_min_s: int = 5
     mutation_cooldown_max_s: int = 16
+    mutation_max_rpm: int = 10
 
     round_pause_min_s: int = 20
     round_pause_max_s: int = 120
