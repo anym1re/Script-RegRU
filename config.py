@@ -60,8 +60,13 @@ class Config:
     target_goal_distinct_subnets: int = 2
     target_pause_s: int = 6 * 60 * 60
     stats_file: str = "daily_stats.txt"
-    strategy_mode: str = "auto"
+    strategy_mode: str = "single" #auto, single, rare
     strategy_auto_probability: float = 0.4
+    single_goal_created_min: int = 120
+    single_goal_created_max: int = 180
+    single_round_size: int = 10
+    single_round_pause_min_s: int = 30
+    single_round_pause_max_s: int = 180
     rare_rotation_slots: int = 1
     rare_keep_max: int = 4
     rare_goal_created_min: int = 60

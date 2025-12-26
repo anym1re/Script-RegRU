@@ -5,7 +5,7 @@
 
 ## Возможности
 - Автоматическое создание/удаление плавающих IP
-- Стратегии перебора: основная, редкая и auto
+- Стратегии перебора: основная, редкая, одиночная и auto
 - Поиск IP в целевых подсетях (`target_cidrs`)
 - Статистика по подсетям в `daily_stats.txt`
 - Уведомления в Telegram (опционально)
@@ -52,7 +52,7 @@ python regru-wl.py
 - `region` — регион для заказа IP
 - `account_limit` — общий лимит IP в аккаунте
 - `goal_total_created` — цель по созданным IP в цикле
-- `strategy_mode` — `auto` / `main` / `rare`
+- `strategy_mode` — `auto` / `main` / `rare` / `single`
 - `target_cidrs` — список целевых подсетей
 - `target_goal_ips`, `target_goal_distinct_subnets` — критерии остановки по целям
 - `headless` — режим запуска браузера

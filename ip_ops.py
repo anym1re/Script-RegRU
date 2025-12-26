@@ -1,6 +1,7 @@
 import ipaddress
 import logging
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Set
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -10,9 +11,21 @@ from timing_utils import human_sleep
 from ui import (
     click_create_button_with_retries,
     list_ips_from_table,
+    list_rows_from_table,
     wait_for_order_page_ready,
     wait_page_ready,
 )
+
+
+@dataclass(frozen=True)
+class CreateResult:
+    status: str
+    ip: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    status: str
 
 
 def has_fatal_error(page: Page, cfg: Config, logger: logging.Logger) -> bool:
@@ -42,7 +55,7 @@ def match_target_network(
     return None
 
 
-def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Optional[str]:
+def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> CreateResult:
     if URL_FLOATING_IPS not in page.url:
         page.goto(URL_FLOATING_IPS)
         wait_page_ready(page)
@@ -95,7 +108,7 @@ def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Opt
     logger.info("Нажатие 'Добавить плавающий IP'...")
     if not click_create_button_with_retries(page, cfg, logger):
         logger.error("Кнопка создания не найдена или неактивна после ретраев!")
-        return None
+        return CreateResult(status="failed")
 
     logger.info("Запрос отправлен. Ожидание результата...")
 
@@ -111,6 +124,7 @@ def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Opt
     human_sleep(cfg, kind="poll")
 
     deadline = time.time() + cfg.create_result_timeout_s
+    saw_creating = False
 
     while time.time() < deadline:
         if URL_FLOATING_IPS not in page.url:
@@ -118,7 +132,8 @@ def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Opt
             wait_page_ready(page)
 
         try:
-            current_ips = set(list_ips_from_table(page))
+            rows = list_rows_from_table(page)
+            current_ips = {r.ip for r in rows if r.ip}
         except Exception as e:
             logger.warning("Ошибка чтения таблицы IP, пробуем перезагрузку: %s", e)
             page.reload()
@@ -131,9 +146,16 @@ def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Opt
         if new_diff:
             new_ip = list(new_diff)[0]
             logger.info(f"Успех! Новый IP: {new_ip}")
-            return new_ip
+            return CreateResult(status="created", ip=new_ip)
 
-        if page.get_by_text("Создается").count() > 0:
+        creating_present = any(r.status == "Создается" for r in rows)
+        if not creating_present:
+            try:
+                creating_present = page.get_by_text("Создается").count() > 0
+            except Exception:
+                creating_present = False
+        if creating_present:
+            saw_creating = True
             if int(time.time()) % 10 == 0:
                 logger.info("Вижу статус 'Создается'...")
 
@@ -149,18 +171,23 @@ def create_one_ip_moscow(page: Page, cfg: Config, logger: logging.Logger) -> Opt
         current_ips = set(list_ips_from_table(page))
     except Exception as e:
         logger.warning("Не удалось перечитать список после перезагрузки: %s", e)
-        return None
+        if saw_creating:
+            return CreateResult(status="pending")
+        return CreateResult(status="failed")
 
     new_diff = current_ips - before_ips
     if new_diff:
         new_ip = list(new_diff)[0]
         logger.info(f"Успех после перезагрузки! Новый IP: {new_ip}")
-        return new_ip
+        return CreateResult(status="created", ip=new_ip)
 
-    return None
+    if saw_creating:
+        return CreateResult(status="pending")
+
+    return CreateResult(status="failed")
 
 
-def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> bool:
+def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> DeleteResult:
     logger.info(f"Удаление IP: {ip}")
 
     if URL_FLOATING_IPS not in page.url:
@@ -171,7 +198,7 @@ def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> bool:
         ip_el = page.get_by_text(ip).first
         if not ip_el.is_visible():
             logger.warning("IP не найден на странице.")
-            return False
+            return DeleteResult(status="deleted")
 
         row = page.locator("div.fip-table__row").filter(has=ip_el).first
         if not row.count():
@@ -179,7 +206,7 @@ def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> bool:
 
         if not row.count():
             logger.warning("Не удалось определить строку таблицы для IP.")
-            return False
+            return DeleteResult(status="failed")
 
         menu_btn = row.locator("button").last
         menu_btn.click()
@@ -200,7 +227,7 @@ def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> bool:
         try:
             row.wait_for(state="detached", timeout=cfg.delete_result_timeout_s * 1000)
             logger.info("IP удален (строка исчезла).")
-            return True
+            return DeleteResult(status="deleted")
         except PlaywrightTimeoutError:
             logger.warning(
                 "Таймаут ожидания удаления (%ss). Делаем перезагрузку...",
@@ -213,14 +240,15 @@ def delete_ip(page: Page, cfg: Config, logger: logging.Logger, ip: str) -> bool:
             current = list_ips_from_table(page)
         except Exception as e:
             logger.warning("Не удалось перечитать список после перезагрузки: %s", e)
-            return False
+            return DeleteResult(status="pending")
 
         if ip not in current:
             logger.info("IP удален (после перезагрузки).")
-            return True
+            return DeleteResult(status="deleted")
 
-        return False
+        logger.info("IP все еще присутствует. Удаление в процессе.")
+        return DeleteResult(status="pending")
 
     except Exception as e:
         logger.error(f"Ошибка удаления: {e}")
-        return False
+        return DeleteResult(status="failed")

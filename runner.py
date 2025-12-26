@@ -22,12 +22,15 @@ from ui import list_ips_from_table, list_rows_from_table, wait_page_ready
 
 def choose_strategy(cfg: Config, logger) -> Tuple[str, List[ipaddress.IPv4Network]]:
     mode = cfg.strategy_mode
-    if mode not in ("auto", "main", "rare"):
+    if mode not in ("auto", "main", "rare", "single"):
         logger.warning("Unknown strategy_mode=%s; treating as main.", mode)
         return "main", []
 
     if mode == "main":
         return "main", []
+
+    if mode == "single":
+        return "single", []
 
     if mode == "rare":
         rare_networks = select_rare_subnets(cfg, logger)
@@ -81,6 +84,74 @@ def read_current_state(page) -> Tuple[List[str], int]:
     current_ips = [r.ip for r in rows if r.ip]
     pending_slots = sum(1 for r in rows if r.status == "Создается" and not r.ip)
     return current_ips, pending_slots
+
+
+def should_stop_due_to_target_slot(
+    cfg: Config,
+    current_ips: List[str],
+    pending_slots: int,
+    matched_target_ips: Set[str],
+) -> bool:
+    if not matched_target_ips:
+        return False
+    total_slots = len(current_ips) + pending_slots
+    if total_slots < cfg.account_limit:
+        return False
+    current_set = set(current_ips)
+    return any(ip in current_set for ip in matched_target_ips)
+
+
+def wait_for_new_ip(
+    page,
+    cfg: Config,
+    logger,
+    before_ips: Set[str],
+    timeout_s: int,
+) -> Optional[str]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if URL_FLOATING_IPS not in page.url:
+            page.goto(URL_FLOATING_IPS)
+            wait_page_ready(page)
+        try:
+            current_ips = set(list_ips_from_table(page))
+        except Exception as e:
+            logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
+            page.reload()
+            wait_page_ready(page)
+            time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+            continue
+        new_ips = current_ips - before_ips
+        if new_ips:
+            return next(iter(new_ips))
+        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+    return None
+
+
+def wait_for_ip_removal(
+    page,
+    cfg: Config,
+    logger,
+    ip: str,
+    timeout_s: int,
+) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if URL_FLOATING_IPS not in page.url:
+            page.goto(URL_FLOATING_IPS)
+            wait_page_ready(page)
+        try:
+            current_ips = set(list_ips_from_table(page))
+        except Exception as e:
+            logger.warning("Ошибка чтения списка IP, пробуем перезагрузку: %s", e)
+            page.reload()
+            wait_page_ready(page)
+            time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+            continue
+        if ip not in current_ips:
+            return True
+        time.sleep(random.uniform(cfg.poll_sleep_min, cfg.poll_sleep_max))
+    return False
 
 
 def format_duration(seconds: float) -> str:
@@ -145,7 +216,12 @@ def cleanup_non_target_ips(
         if match_target_network(ip, target_networks):
             continue
         cooldown_between_mutations(cfg, logger)
-        if not delete_ip(page, cfg, logger, ip):
+        delete_result = delete_ip(page, cfg, logger, ip)
+        if delete_result.status == "pending":
+            logger.info("Удаление в процессе, слот занят. Продолжаю очистку.")
+            wait_page_ready(page)
+            continue
+        if delete_result.status != "deleted":
             logger.warning("Delete failed during final cleanup.")
             return False
         wait_page_ready(page)
@@ -250,18 +326,105 @@ def run(cfg: Config) -> int:
                         page.goto(URL_FLOATING_IPS)
                         wait_page_ready(page)
 
-                    current_ips = list_ips_from_table(page)
+                    current_ips, pending_slots = read_current_state(page)
+                    new_ips = [ip for ip in current_ips if ip not in last_ips]
+                    if new_ips:
+                        stop_rare = False
+                        for ip in new_ips:
+                            total_created += 1
+                            logger.info("Detected new IP: %s", ip)
+                            update_daily_stats(ip, cfg, logger)
+                            update_cycle_stats(ip, cycle_counts)
+
+                            hit_net = (
+                                match_target_network(ip, target_networks)
+                                if target_networks
+                                else None
+                            )
+                            if hit_net:
+                                matched_target_ips.add(ip)
+                                matched_target_subnets.add(str(hit_net))
+                                logger.info("Target CIDR hit: %s in %s", ip, hit_net)
+                                notify_target_hit(
+                                    logger,
+                                    ip,
+                                    hit_net,
+                                    len(matched_target_ips),
+                                    len(matched_target_subnets),
+                                )
+                                logger.info(
+                                    "Переборный слот закрыт, редкая стратегия завершена."
+                                )
+                                stop_rare = True
+                                break
+
+                            rare_hit = (
+                                match_target_network(ip, rare_networks)
+                                if rare_networks
+                                else None
+                            )
+                            try:
+                                subnet = str(
+                                    ipaddress.ip_network(f"{ip}/24", strict=False)
+                                )
+                            except ValueError:
+                                subnet = ""
+                            is_new_subnet = subnet and subnet not in known_subnets
+                            if is_new_subnet:
+                                known_subnets.add(subnet)
+                                logger.info("New subnet in stats: %s", subnet)
+
+                            if rare_hit:
+                                if len(matched_rare_ips) < keep_cap:
+                                    matched_rare_ips.add(ip)
+                                    logger.info("Rare subnet hit: %s in %s", ip, rare_hit)
+                                    logger.info(
+                                        "Rare keep: %d/%d",
+                                        len(matched_rare_ips),
+                                        keep_cap,
+                                    )
+                                else:
+                                    logger.info(
+                                        "Rare subnet hit (limit %d reached); keep probing.",
+                                        keep_cap,
+                                    )
+                            elif is_new_subnet:
+                                if len(matched_rare_ips) < keep_cap:
+                                    matched_rare_ips.add(ip)
+                                    logger.info("Rare by new subnet: %s", subnet)
+                                    logger.info(
+                                        "Rare keep: %d/%d",
+                                        len(matched_rare_ips),
+                                        keep_cap,
+                                    )
+                                else:
+                                    logger.info(
+                                        "New subnet (limit %d reached); keep probing.",
+                                        keep_cap,
+                                    )
+                        if stop_rare:
+                            last_ips = set(current_ips)
+                            break
+                    last_ips = set(current_ips)
                     protected_ips = set(base_ips) | matched_target_ips | matched_rare_ips
                     probe_ips = [ip for ip in current_ips if ip not in protected_ips]
 
-                    if len(current_ips) >= cfg.account_limit:
+                    total_slots = len(current_ips) + pending_slots
+                    if total_slots >= cfg.account_limit:
                         if not probe_ips:
                             logger.info(
                                 "Нет свободных слотов для перебора. Завершаю редкую стратегию."
                             )
                             break
                         cooldown_between_mutations(cfg, logger)
-                        if not delete_ip(page, cfg, logger, probe_ips[0]):
+                        delete_result = delete_ip(page, cfg, logger, probe_ips[0])
+                        if delete_result.status == "pending":
+                            logger.info(
+                                "Удаление в процессе, слот занят. Продолжаю работу."
+                            )
+                            wait_page_ready(page)
+                            continue
+                        if delete_result.status != "deleted":
                             logger.warning("Delete failed.")
                             if has_fatal_error(page, cfg, logger):
                                 logger.error("Фатальная ошибка. Выход.")
@@ -283,7 +446,14 @@ def run(cfg: Config) -> int:
 
                     if len(probe_ips) >= probe_slots:
                         cooldown_between_mutations(cfg, logger)
-                        if not delete_ip(page, cfg, logger, probe_ips[0]):
+                        delete_result = delete_ip(page, cfg, logger, probe_ips[0])
+                        if delete_result.status == "pending":
+                            logger.info(
+                                "Удаление в процессе, слот занят. Продолжаю работу."
+                            )
+                            wait_page_ready(page)
+                            continue
+                        if delete_result.status != "deleted":
                             logger.warning("Delete failed.")
                             if has_fatal_error(page, cfg, logger):
                                 logger.error("Фатальная ошибка. Выход.")
@@ -305,8 +475,10 @@ def run(cfg: Config) -> int:
 
                     cooldown_between_mutations(cfg, logger)
 
-                    ip = create_one_ip_moscow(page, cfg, logger)
-                    if ip:
+                    result = create_one_ip_moscow(page, cfg, logger)
+                    if result.status == "created" and result.ip:
+                        ip = result.ip
+                        last_ips.add(ip)
                         total_created += 1
                         logger.info("Created: %s", ip)
                         update_daily_stats(ip, cfg, logger)
@@ -375,6 +547,10 @@ def run(cfg: Config) -> int:
                                 )
 
                         wait_page_ready(page)
+                    elif result.status == "pending":
+                        logger.info(
+                            "Создание в статусе 'Создается'. Слот занят, продолжаю работу."
+                        )
                     else:
                         logger.warning("Create failed/timeout.")
                         if has_fatal_error(page, cfg, logger):
@@ -392,6 +568,235 @@ def run(cfg: Config) -> int:
                         )
                         restart_cycle = True
                         break
+
+                if pause_after_cleanup_s:
+                    logger.info(
+                        "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
+                        cfg.failure_pause_s / 60,
+                    )
+                    if pause_reason:
+                        notify_pause(logger, pause_reason, pause_after_cleanup_s)
+                    time.sleep(pause_after_cleanup_s)
+                    if restart_cycle:
+                        continue
+
+            elif strategy == "single":
+                total_created = 0
+                round_created = 0
+                restart_cycle = False
+                goal_created = random.randint(
+                    cfg.single_goal_created_min, cfg.single_goal_created_max
+                )
+                round_size = max(1, cfg.single_round_size)
+                pause_after_cleanup_s: Optional[float] = None
+                pause_reason: Optional[str] = None
+
+                logger.info(
+                    "Single strategy: goal %d created (range %d-%d)",
+                    goal_created,
+                    cfg.single_goal_created_min,
+                    cfg.single_goal_created_max,
+                )
+                logger.info(
+                    "Single strategy: round size=%d, pause %d-%d s",
+                    round_size,
+                    cfg.single_round_pause_min_s,
+                    cfg.single_round_pause_max_s,
+                )
+
+                while total_created < goal_created:
+                    if URL_FLOATING_IPS not in page.url:
+                        page.goto(URL_FLOATING_IPS)
+                        wait_page_ready(page)
+
+                    current_ips, pending_slots = read_current_state(page)
+                    if should_stop_due_to_target_slot(
+                        cfg, current_ips, pending_slots, matched_target_ips
+                    ):
+                        logger.info(
+                            "Target IP occupies last slot. Stopping single strategy."
+                        )
+                        notify_status(
+                            logger,
+                            "Целевой IP занял последний слот; завершаю работу.",
+                        )
+                        notify_cycle_stats(logger, cycle_counts)
+                        return 0
+                    total_slots = len(current_ips) + pending_slots
+
+                    if total_slots >= cfg.account_limit:
+                        pause = random.uniform(
+                            cfg.single_round_pause_min_s,
+                            cfg.single_round_pause_max_s,
+                        )
+                        logger.info(
+                            "Account limit reached. Waiting %.1fs before retry.", pause
+                        )
+                        notify_pause(
+                            logger,
+                            "Лимит аккаунта; ожидание свободного слота",
+                            pause,
+                        )
+                        time.sleep(pause)
+                        continue
+
+                    before_ips = set(current_ips)
+
+                    cooldown_between_mutations(cfg, logger)
+
+                    result = create_one_ip_moscow(page, cfg, logger)
+                    if result.status == "created" and result.ip:
+                        ip = result.ip
+                    elif result.status == "pending":
+                        logger.info(
+                            "Создание в статусе 'Создается'. Ожидание завершения."
+                        )
+                        ip = wait_for_new_ip(
+                            page,
+                            cfg,
+                            logger,
+                            before_ips,
+                            cfg.create_result_timeout_s,
+                        )
+                    else:
+                        logger.warning("Create failed/timeout.")
+                        if has_fatal_error(page, cfg, logger):
+                            logger.error("Фатальная ошибка. Выход.")
+                            return exit_with_error(
+                                cfg,
+                                logger,
+                                2,
+                                "Фатальная ошибка при создании IP (одиночная стратегия).",
+                            )
+                        pause_after_cleanup_s = cfg.failure_pause_s
+                        pause_reason = (
+                            "Нефатальная ошибка при создании IP (одиночная стратегия); "
+                            "перезапуск цикла"
+                        )
+                        restart_cycle = True
+                        break
+
+                    if not ip:
+                        logger.warning("Не удалось получить IP после ожидания.")
+                        if has_fatal_error(page, cfg, logger):
+                            logger.error("Фатальная ошибка. Выход.")
+                            return exit_with_error(
+                                cfg,
+                                logger,
+                                2,
+                                "Фатальная ошибка при создании IP (одиночная стратегия).",
+                            )
+                        pause_after_cleanup_s = cfg.failure_pause_s
+                        pause_reason = (
+                            "Нефатальная ошибка при создании IP (одиночная стратегия); "
+                            "перезапуск цикла"
+                        )
+                        restart_cycle = True
+                        break
+
+                    total_created += 1
+                    round_created += 1
+                    logger.info("Created: %s", ip)
+                    update_daily_stats(ip, cfg, logger)
+                    update_cycle_stats(ip, cycle_counts)
+
+                    skip_delete = False
+                    if target_networks:
+                        hit_net = match_target_network(ip, target_networks)
+                    else:
+                        hit_net = None
+
+                    if hit_net:
+                        matched_target_ips.add(ip)
+                        matched_target_subnets.add(str(hit_net))
+                        logger.info("Target CIDR hit: %s in %s", ip, hit_net)
+                        notify_target_hit(
+                            logger,
+                            ip,
+                            hit_net,
+                            len(matched_target_ips),
+                            len(matched_target_subnets),
+                        )
+                        skip_delete = True
+
+                    wait_page_ready(page)
+
+                    if skip_delete:
+                        current_ips, pending_slots = read_current_state(page)
+                        if should_stop_due_to_target_slot(
+                            cfg, current_ips, pending_slots, matched_target_ips
+                        ):
+                            logger.info(
+                                "Target IP occupies last slot. Stopping single strategy."
+                            )
+                            notify_status(
+                                logger,
+                                "Целевой IP занял последний слот; завершаю работу.",
+                            )
+                            notify_cycle_stats(logger, cycle_counts)
+                            return 0
+                    else:
+                        cooldown_between_mutations(cfg, logger)
+
+                        delete_result = delete_ip(page, cfg, logger, ip)
+                        if delete_result.status == "pending":
+                            logger.info("Удаление в процессе. Ожидание завершения.")
+                            if not wait_for_ip_removal(
+                                page,
+                                cfg,
+                                logger,
+                                ip,
+                                cfg.delete_result_timeout_s,
+                            ):
+                                logger.warning("Удаление не завершилось по таймауту.")
+                                if has_fatal_error(page, cfg, logger):
+                                    logger.error("Фатальная ошибка. Выход.")
+                                    return exit_with_error(
+                                        cfg,
+                                        logger,
+                                        3,
+                                        "Фатальная ошибка при удалении IP (одиночная стратегия).",
+                                    )
+                                pause_after_cleanup_s = cfg.failure_pause_s
+                                pause_reason = (
+                                    "Нефатальная ошибка при удалении IP (одиночная стратегия); "
+                                    "перезапуск цикла"
+                                )
+                                restart_cycle = True
+                                break
+                        elif delete_result.status != "deleted":
+                            logger.warning("Delete failed.")
+                            if has_fatal_error(page, cfg, logger):
+                                logger.error("Фатальная ошибка. Выход.")
+                                return exit_with_error(
+                                    cfg,
+                                    logger,
+                                    3,
+                                    "Фатальная ошибка при удалении IP (одиночная стратегия).",
+                                )
+                            pause_after_cleanup_s = cfg.failure_pause_s
+                            pause_reason = (
+                                "Нефатальная ошибка при удалении IP (одиночная стратегия); "
+                                "перезапуск цикла"
+                            )
+                            restart_cycle = True
+                            break
+
+                        wait_page_ready(page)
+
+                    if round_created >= round_size and total_created < goal_created:
+                        pause = random.uniform(
+                            cfg.single_round_pause_min_s,
+                            cfg.single_round_pause_max_s,
+                        )
+                        logger.info("Inter-round pause (single): %.1fs", pause)
+                        notify_pause(
+                            logger,
+                            "Пауза между раундами (одиночная стратегия)",
+                            pause,
+                        )
+                        time.sleep(pause)
+                        round_created = 0
 
                 if pause_after_cleanup_s:
                     logger.info(
@@ -429,11 +834,65 @@ def run(cfg: Config) -> int:
                     stop_after_cleanup = False
 
                     while True:
-                        current_ips = list_ips_from_table(page)
-                        if len(current_ips) >= round_cap:
+                        current_ips, pending_slots = read_current_state(page)
+                        new_ips = [ip for ip in current_ips if ip not in last_ips]
+                        if new_ips:
+                            for ip in new_ips:
+                                total_created += 1
+                                logger.info("Detected new IP: %s", ip)
+                                if ip not in round_created:
+                                    round_created.append(ip)
+                                update_daily_stats(ip, cfg, logger)
+                                update_cycle_stats(ip, cycle_counts)
+
+                                if target_networks:
+                                    hit_net = match_target_network(ip, target_networks)
+                                else:
+                                    hit_net = None
+
+                                if hit_net:
+                                    matched_target_ips.add(ip)
+                                    matched_target_subnets.add(str(hit_net))
+                                    logger.info("Target CIDR hit: %s in %s", ip, hit_net)
+                                    notify_target_hit(
+                                        logger,
+                                        ip,
+                                        hit_net,
+                                        len(matched_target_ips),
+                                        len(matched_target_subnets),
+                                    )
+
+                                    if (
+                                        len(matched_target_subnets)
+                                        >= cfg.target_goal_distinct_subnets
+                                    ):
+                                        stop_after_cleanup = True
+                                    elif len(matched_target_ips) >= cfg.target_goal_ips:
+                                        stop_after_cleanup = True
+                                        logger.info(
+                                            "Цель по количеству IP достигнута, но подсетей: %d",
+                                            len(matched_target_subnets),
+                                        )
+                                    elif not paused_after_first_target:
+                                        pause_after_cleanup_s = cfg.target_pause_s
+                                        pause_reason = (
+                                            "Получен IP из целевых подсетей; пауза перед продолжением"
+                                        )
+                                        paused_after_first_target = True
+
+                                    if stop_after_cleanup or pause_after_cleanup_s:
+                                        break
+                            last_ips = set(current_ips)
+                            if stop_after_cleanup or pause_after_cleanup_s:
+                                break
+                        else:
+                            last_ips = set(current_ips)
+
+                        total_slots = len(current_ips) + pending_slots
+                        if total_slots >= round_cap:
                             logger.info("Round cap reached.")
                             break
-                        if len(current_ips) >= cfg.account_limit:
+                        if total_slots >= cfg.account_limit:
                             logger.info("Account limit reached.")
                             break
                         if total_created >= cfg.goal_total_created:
@@ -441,8 +900,10 @@ def run(cfg: Config) -> int:
 
                         cooldown_between_mutations(cfg, logger)
 
-                        ip = create_one_ip_moscow(page, cfg, logger)
-                        if ip:
+                        result = create_one_ip_moscow(page, cfg, logger)
+                        if result.status == "created" and result.ip:
+                            ip = result.ip
+                            last_ips.add(ip)
                             round_created.append(ip)
                             total_created += 1
                             logger.info("Created: %s", ip)
@@ -486,6 +947,10 @@ def run(cfg: Config) -> int:
 
                                 if stop_after_cleanup or pause_after_cleanup_s:
                                     break
+                        elif result.status == "pending":
+                            logger.info(
+                                "Создание в статусе 'Создается'. Слот занят, продолжаю работу."
+                            )
                         else:
                             logger.warning("Create failed/timeout.")
                             if has_fatal_error(page, cfg, logger):
@@ -515,7 +980,14 @@ def run(cfg: Config) -> int:
 
                         cooldown_between_mutations(cfg, logger)
 
-                        if not delete_ip(page, cfg, logger, ip):
+                        delete_result = delete_ip(page, cfg, logger, ip)
+                        if delete_result.status == "pending":
+                            logger.info(
+                                "Удаление в процессе, слот занят. Продолжаю работу."
+                            )
+                            wait_page_ready(page)
+                            continue
+                        if delete_result.status != "deleted":
                             logger.warning("Delete failed.")
                             if has_fatal_error(page, cfg, logger):
                                 logger.error("Фатальная ошибка. Выход.")
@@ -581,26 +1053,29 @@ def run(cfg: Config) -> int:
                 if restart_cycle:
                     continue
 
-            if not cleanup_non_target_ips(page, cfg, logger, target_networks):
-                if has_fatal_error(page, cfg, logger):
-                    logger.error("Фатальная ошибка. Выход.")
-                    return exit_with_error(
-                        cfg,
-                        logger,
-                        3,
-                        "Фатальная ошибка при финальной очистке.",
+            if strategy == "single":
+                logger.info("Single strategy: skip cleanup of non-target IPs.")
+            else:
+                if not cleanup_non_target_ips(page, cfg, logger, target_networks):
+                    if has_fatal_error(page, cfg, logger):
+                        logger.error("Фатальная ошибка. Выход.")
+                        return exit_with_error(
+                            cfg,
+                            logger,
+                            3,
+                            "Фатальная ошибка при финальной очистке.",
+                        )
+                    logger.info(
+                        "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
+                        cfg.failure_pause_s / 60,
                     )
-                logger.info(
-                    "Нефатальная ошибка. Пауза на %.1f минут и перезапуск цикла.",
-                    cfg.failure_pause_s / 60,
-                )
-                notify_pause(
-                    logger,
-                    "Нефатальная ошибка при финальной очистке; перезапуск цикла",
-                    cfg.failure_pause_s,
-                )
-                time.sleep(cfg.failure_pause_s)
-                continue
+                    notify_pause(
+                        logger,
+                        "Нефатальная ошибка при финальной очистке; перезапуск цикла",
+                        cfg.failure_pause_s,
+                    )
+                    time.sleep(cfg.failure_pause_s)
+                    continue
 
             notify_cycle_stats(logger, cycle_counts)
             logger.info("Запуск завершен. Начинаю финальную паузу...")
