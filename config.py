@@ -75,7 +75,7 @@ class Config:
     rare_goal_created_min: int = 60
     rare_goal_created_max: int = 80
     rare_subnet_max_count: int = 1
-    rare_subnet_top_n: int = 0
+    rare_subnet_top_n: int = 1
     fatal_error_markers: Tuple[str, ...] = (
         "429",
         "too many requests",

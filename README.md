@@ -55,6 +55,8 @@ python regru-wl.py
 - `strategy_mode` — `auto` / `main` / `rare` / `single`
 - `target_cidrs` — список целевых подсетей
 - `target_goal_ips`, `target_goal_distinct_subnets` — критерии остановки по целям
+- `rare_subnet_top_n` — при `rare` выбирает N самых редких подсетей за день по `daily_stats.txt` (минимальные счётчики)
+- `rare_subnet_max_count` — если `rare_subnet_top_n=0`, берутся подсети с количеством попаданий ≤ этого значения
 - `headless` — режим запуска браузера
 
 ## Логи и служебные файлы
