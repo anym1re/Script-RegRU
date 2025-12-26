@@ -291,7 +291,7 @@ def notify_status(logger, message: str) -> None:
 
 
 def notify_pause(logger, reason: str, seconds: float) -> None:
-    text = f"Пауза: {reason}. Длительность: {format_duration(seconds)}."
+    text = f"{reason}. Длительность: {format_duration(seconds)}."
     send_telegram_message(logger, text)
 
 
@@ -890,6 +890,7 @@ def run(cfg: Config) -> int:
                             cfg.single_round_pause_max_s,
                         )
                         logger.info("Inter-round pause (single): %.1fs", pause)
+                        notify_cycle_stats(logger, cycle_counts)
                         notify_pause(
                             logger,
                             "Пауза между раундами (одиночная стратегия)",
